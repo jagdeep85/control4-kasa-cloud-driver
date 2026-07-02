@@ -604,6 +604,24 @@ local function DispatchCommand(cmd, tParams)
     TurnOff()
   elseif cmd == "TOGGLE" then
     if g_currentOn then TurnOff() else TurnOn() end
+  elseif cmd == "BUTTON_ACTION" then
+    -- Neeo/Halo remotes and keypads drive light_v2 via BUTTON_ACTION, NOT ON/OFF/TOGGLE.
+    -- (The phone app uses SET_BRIGHTNESS_TARGET, which is why it works and the remote didn't.)
+    -- BUTTON_ID: 0 = top/on, 1 = bottom/off, 2 = toggle (bulb icon / Navigator Toggle).
+    -- ACTION:    1 = press, 2 = release, 0 = long release. Act on release to match the
+    -- stock light proxy and avoid double-firing on the press+release pair.
+    local button = tostring(tParams and tParams["BUTTON_ID"] or "")
+    local action = tostring(tParams and tParams["ACTION"] or "")
+    dbg("BUTTON_ACTION button=" .. button .. " action=" .. action)
+    if action == "2" then
+      if button == "0" then
+        TurnOn()
+      elseif button == "1" then
+        TurnOff()
+      elseif button == "2" then
+        if g_currentOn then TurnOff() else TurnOn() end
+      end
+    end
   elseif cmd == "SET_BRIGHTNESS_TARGET" then
     SetBrightness(tonumber(tParams and (tParams["LIGHT_BRIGHTNESS_TARGET"] or tParams["LIGHT"])) or 100)
   elseif cmd == "RAMP_TO_LEVEL" then

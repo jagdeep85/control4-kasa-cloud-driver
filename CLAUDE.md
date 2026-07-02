@@ -42,7 +42,8 @@ C4:SendToProxy(5001, "LIGHT_BRIGHTNESS_CHANGED", { LIGHT_BRIGHTNESS_CURRENT = le
 - On/off is derived from the level (0 = off); there is no separate state notify for dimmers.
 - Incoming commands from the proxy are `SET_BRIGHTNESS_TARGET`/`RAMP_TO_LEVEL` with param `LIGHT_BRIGHTNESS_TARGET` (not `LIGHT`), plus `RATE`.
 - **There is no `ON`/`OFF` command** — the v2 proxy has no such commands. The navigator's on/off toggle sends `SET_BRIGHTNESS_TARGET` with level **0** (off) or the on-preset level (on), or a `TOGGLE` command. So brightness 0 must be routed to a real relay-off (not `set_brightness:0`, which leaves an IOT dimmer on at minimum), and `TOGGLE` must be handled (toggles on `g_currentOn`). The `ON`/`OFF` handlers are kept only for Composer programming/actions.
-- Source: https://snap-one.github.io/docs-driverworks-proxyprotocol/ → Light V2 Protocol Notifications.
+- **Neeo/Halo remotes and keypads use `BUTTON_ACTION`, not `SET_BRIGHTNESS_TARGET`.** The phone app slider/toggle sends `SET_BRIGHTNESS_TARGET`; the remote's **Bulb icon** (and Android Navigator's Toggle) sends `BUTTON_ACTION` with `BUTTON_ID` (`0` = top/on, `1` = bottom/off, `2` = toggle) and `ACTION` (`1` = press, `2` = release, `0` = long release). Act on **release** (`ACTION == "2"`) to match the stock light proxy and avoid double-firing. Without this handler the remote's Bulb press is silently dropped (symptom: works in app, nothing on remote). Params arrive as strings.
+- Source: https://snap-one.github.io/docs-driverworks-proxyprotocol/ → Light V2 Protocol Notifications; BUTTON_ID/ACTION values from control4/docs-driverworks `sample_drivers/light_sample.c4i`.
 
 ## Packaging
 

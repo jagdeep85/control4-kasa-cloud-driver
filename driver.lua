@@ -23,6 +23,7 @@ local ACCOUNT_FILE   = "kasa_account"  -- driver filename of the Kasa Account ag
 local ACCOUNT_NAME   = "TP-Link Kasa Account"
 local TOKEN_VAR_ID   = 3001   -- token variable owned by the account agent
 local DEVLIST_VAR_ID = 3002   -- device-list JSON variable owned by the account agent
+local KLAP_HASH_VAR_ID = 3003 -- KLAP auth hash (hex) owned by the account agent
 
 local AUTH_ERRORS = { [-1003] = true, [-1010] = true, [-20651] = true }
 
@@ -32,6 +33,7 @@ local AUTH_ERRORS = { [-1003] = true, [-1010] = true, [-20651] = true }
 
 local g_token        = ""
 local g_deviceId     = ""
+local g_appServerUrl = ""      -- per-device regional endpoint (from getDeviceList); "" = use API_URL
 local g_deviceType   = "IOT"   -- "IOT" or "SMART"
 local g_isDimmer     = false
 local g_pollInterval = 60
@@ -43,6 +45,12 @@ local g_deviceList   = {}      -- cached device list from the account driver
 
 local g_currentLevel = 0
 local g_currentOn    = false
+
+-- Local KLAP control (SMART / KS205 / KS225 devices that are dead on the cloud)
+local g_localIp      = ""       -- device LAN IP; "" = use cloud passthrough
+local g_klapAuthHash = ""       -- raw 32-byte SHA256(SHA1(user)..SHA1(pass)) from account var 3003
+local g_klap         = nil      -- active KLAP session { key, sig, iv, seq, cookie }
+local g_terminalUuid = "C4KASAKLAP0001"
 
 -- ---------------------------------------------------------------------------
 -- Logging
@@ -194,8 +202,201 @@ local function toJson(t)   return json_encode(t) end
 local function fromJson(s) return json_decode(s)  end
 
 -- ---------------------------------------------------------------------------
+-- KLAP local transport (KlapV2) — for SMART devices unreachable via the cloud
+-- ---------------------------------------------------------------------------
+-- KS205/KS225 dropped off the legacy Kasa cloud (status=0 / error -20571). They
+-- speak the encrypted KLAP protocol on the LAN. We implement KlapV2 natively:
+--   auth_hash = SHA256(SHA1(user)..SHA1(pass))   (supplied by the account driver)
+--   handshake1/2 authenticate and derive an AES-128-CBC session; /app/request
+--   carries the same SMART {method,params} payloads the cloud path already builds.
+
+-- Raw-byte crypto wrappers over the C4 crypto API (all NONE = raw in/out).
+local function sha1(raw)   return C4:Hash("SHA1",   raw, { data_encoding = "NONE", return_encoding = "NONE" }) end
+local function sha256(raw) return C4:Hash("SHA256", raw, { data_encoding = "NONE", return_encoding = "NONE" }) end
+
+local function aesEnc(key, iv, data)
+  return C4:Encrypt("AES-128-CBC", key, iv, data,
+    { key_encoding = "NONE", iv_encoding = "NONE", data_encoding = "NONE", return_encoding = "NONE", padding = false })
+end
+local function aesDec(key, iv, data)
+  return C4:Decrypt("AES-128-CBC", key, iv, data,
+    { key_encoding = "NONE", iv_encoding = "NONE", data_encoding = "NONE", return_encoding = "NONE", padding = false })
+end
+
+-- Big-endian 32-bit (un)packing without string.pack — works on Lua 5.1 and 5.3.
+local function packU32(n)
+  n = n % 4294967296
+  return string.char(
+    math.floor(n / 16777216) % 256,
+    math.floor(n / 65536)    % 256,
+    math.floor(n / 256)      % 256,
+    n % 256)
+end
+local function unpackI32BE(s)
+  local b1, b2, b3, b4 = s:byte(1, 4)
+  local n = b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
+  if n >= 2147483648 then n = n - 4294967296 end   -- signed
+  return n
+end
+
+local function pkcs7pad(s)
+  local n = 16 - (#s % 16)
+  return s .. string.rep(string.char(n), n)
+end
+local function pkcs7unpad(s)
+  if #s == 0 then return s end
+  local n = s:byte(#s)
+  if not n or n < 1 or n > 16 or n > #s then return s end
+  return s:sub(1, #s - n)
+end
+
+local g_randSeeded = false
+local function randBytes(n)
+  if not g_randSeeded then
+    math.randomseed(os.time() + math.floor((os.clock() or 0) * 1000000))
+    g_randSeeded = true
+  end
+  local out, ent = "", tostring(os.time()) .. ":" .. tostring(os.clock()) .. ":" .. tostring(math.random())
+  while #out < n do
+    ent = sha256(ent .. tostring(math.random()))
+    out = out .. ent
+  end
+  return out:sub(1, n)
+end
+
+local function hexToRaw(hex)
+  if type(hex) ~= "string" or hex == "" then return "" end
+  return (hex:gsub("%x%x", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+-- Raw binary POST to the device; extracts the TP_SESSIONID cookie from the response.
+local function KlapHttp(path, body, cookie, callback)  -- callback(strData, nCode, sessionCookie, errMsg)
+  local url = "http://" .. g_localIp .. path
+  local headers = { ["Content-Type"] = "application/octet-stream" }
+  if cookie and cookie ~= "" then headers["Cookie"] = cookie end
+  dbg("KLAP POST " .. url .. " (" .. #body .. "B)")
+  C4:urlPost(url, body, headers, false, function(strError, strData, nCode, tHeaders)
+    if type(strError) == "string" and strError ~= "" then
+      callback(nil, nil, nil, strError); return
+    end
+    local sessionCookie
+    if type(tHeaders) == "table" then
+      local sc = tHeaders["Set-Cookie"] or tHeaders["set-cookie"]
+      if type(sc) == "table" then sc = sc[1] end
+      if type(sc) == "string" then
+        local sid = sc:match("TP_SESSIONID=([^;]+)")
+        if sid then sessionCookie = "TP_SESSIONID=" .. sid end
+      end
+    end
+    callback(strData, nCode, sessionCookie, nil)
+  end)
+end
+
+-- handshake1 + handshake2 → derive AES session. callback(ok, errMsg)
+local function KlapHandshake(callback)
+  if g_localIp == "" then callback(false, "no local IP set"); return end
+  if g_klapAuthHash == "" then callback(false, "no KLAP auth hash (account driver not ready)"); return end
+
+  local localSeed = randBytes(16)
+  KlapHttp("/app/handshake1", localSeed, nil, function(data, code, cookie, err1)
+    if err1 then callback(false, "handshake1: " .. tostring(err1)); return end
+    if code ~= 200 or type(data) ~= "string" or #data < 48 then
+      callback(false, "handshake1 code=" .. tostring(code) .. " len=" .. tostring(data and #data)); return
+    end
+    if not cookie then callback(false, "handshake1 missing TP_SESSIONID cookie"); return end
+    local remoteSeed = data:sub(1, 16)
+    local serverHash = data:sub(17, 48)
+    if sha256(localSeed .. remoteSeed .. g_klapAuthHash) ~= serverHash then
+      callback(false, "handshake1 auth mismatch — wrong credentials or non-KlapV2 device"); return
+    end
+    local payload2 = sha256(remoteSeed .. localSeed .. g_klapAuthHash)
+    KlapHttp("/app/handshake2", payload2, cookie, function(_, code2, _, err2)
+      if err2 then callback(false, "handshake2: " .. tostring(err2)); return end
+      if code2 ~= 200 then callback(false, "handshake2 code=" .. tostring(code2)); return end
+      local ah = g_klapAuthHash
+      local ivfull = sha256("iv" .. localSeed .. remoteSeed .. ah)
+      g_klap = {
+        key    = sha256("lsk" .. localSeed .. remoteSeed .. ah):sub(1, 16),
+        sig    = sha256("ldk" .. localSeed .. remoteSeed .. ah):sub(1, 28),
+        iv     = ivfull:sub(1, 12),
+        seq    = unpackI32BE(ivfull:sub(29, 32)),
+        cookie = cookie,
+      }
+      dbg("KLAP session established (seq=" .. g_klap.seq .. ")")
+      callback(true, nil)
+    end)
+  end)
+end
+
+-- Encrypted request over an established session. callback(respTable, errMsg).
+-- On HTTP 403 (session expired) it re-handshakes once and retries.
+local function KlapRequest(jsonStr, callback, isRetry)
+  local function doReq()
+    local s = g_klap
+    s.seq = s.seq + 1
+    local seq   = s.seq
+    local ivSeq = s.iv .. packU32(seq)
+    local ct    = aesEnc(s.key, ivSeq, pkcs7pad(jsonStr))
+    if type(ct) ~= "string" then callback(nil, "AES encrypt failed"); return end
+    local body = sha256(s.sig .. packU32(seq) .. ct) .. ct
+    KlapHttp("/app/request?seq=" .. tostring(seq), body, s.cookie, function(data, code, _, err3)
+      if err3 then callback(nil, "request: " .. tostring(err3)); return end
+      if code == 403 then
+        g_klap = nil
+        if isRetry then callback(nil, "403 after re-handshake"); return end
+        dbg("KLAP 403 — re-handshaking")
+        KlapHandshake(function(ok, hErr)
+          if not ok then callback(nil, "re-handshake: " .. tostring(hErr)); return end
+          KlapRequest(jsonStr, callback, true)
+        end)
+        return
+      end
+      if code ~= 200 or type(data) ~= "string" or #data <= 32 then
+        callback(nil, "request code=" .. tostring(code) .. " len=" .. tostring(data and #data)); return
+      end
+      local pt = aesDec(s.key, ivSeq, data:sub(33))
+      if type(pt) ~= "string" then callback(nil, "AES decrypt failed"); return end
+      pt = pkcs7unpad(pt)
+      dbg("KLAP response: " .. pt)
+      callback(fromJson(pt), nil)
+    end)
+  end
+
+  if not g_klap then
+    KlapHandshake(function(ok, hErr)
+      if not ok then callback(nil, "handshake: " .. tostring(hErr)); return end
+      doReq()
+    end)
+  else
+    doReq()
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Config loader
 -- ---------------------------------------------------------------------------
+
+-- Find this device's per-device appServerUrl in the account's cached list.
+-- Kasa homes devices on different regional clouds; using the wrong endpoint
+-- returns error -20571 ("device offline") even when the device is online.
+local function ResolveAppServer()
+  if g_deviceId == "" then return end
+  for _, d in ipairs(g_deviceList) do
+    if tostring(d.i) == g_deviceId then
+      if type(d.u) == "string" and d.u ~= "" then
+        if d.u ~= g_appServerUrl then
+          g_appServerUrl = d.u
+          dbg("Resolved app server for device: " .. g_appServerUrl)
+        end
+      else
+        dbg("Device in list but no appServerUrl — UPDATE the account driver (v7+) and run " ..
+            "'Refresh Device List'. Falling back to " .. API_URL)
+      end
+      return
+    end
+  end
+  dbg("Device " .. g_deviceId .. " not in cached list yet — appServerUrl unresolved")
+end
 
 local function LoadConfig()
   g_deviceId     = Properties["Device ID"]         or ""
@@ -203,7 +404,12 @@ local function LoadConfig()
   g_isDimmer     = (Properties["Is Dimmer"]        == "Yes")
   g_pollInterval = tonumber(Properties["Poll Interval (sec)"]) or 60
   g_debug        = (Properties["Debug"]            == "On")
-  log("Config loaded — device=" .. g_deviceId .. " type=" .. g_deviceType)
+  local newIp    = (Properties["Local IP (KLAP)"] or ""):gsub("%s+", "")
+  if newIp ~= g_localIp then g_klap = nil end   -- IP changed → drop stale session
+  g_localIp      = newIp
+  ResolveAppServer()
+  log("Config loaded — device=" .. g_deviceId .. " type=" .. g_deviceType ..
+      (g_localIp ~= "" and (" localIp=" .. g_localIp) or ""))
 end
 
 -- ---------------------------------------------------------------------------
@@ -281,6 +487,7 @@ local function PopulateDeviceList()
     C4:UpdatePropertyList("Select Device From List", table.concat(aliases, ","))
     dbg("Populated device dropdown — " .. #aliases .. " devices")
   end
+  ResolveAppServer()   -- list just refreshed — pick up this device's endpoint
 end
 
 -- Apply the device the installer picked in the dropdown to the real properties.
@@ -321,7 +528,8 @@ local function SendPassthrough(requestData, callback, isRetry)
       requestData = toJson(requestData),
     }
   })
-  local url = API_URL .. "?token=" .. g_token
+  local base = (g_appServerUrl ~= "" and g_appServerUrl) or API_URL
+  local url = base .. "?token=" .. g_token
 
   HttpPost(url, payload, function(resp, httpErr)
     if not resp then
@@ -336,8 +544,19 @@ local function SendPassthrough(requestData, callback, isRetry)
       return
     end
     if resp.error_code ~= 0 then
-      err("Passthrough API error " .. tostring(resp.error_code))
-      C4:UpdateProperty("Status", "Error: API code " .. tostring(resp.error_code))
+      if resp.error_code == -20571 then
+        local hint = ""
+        if g_deviceType == "SMART" then
+          hint = " — KS205/KS225 use the KLAP protocol and drop off the legacy Kasa cloud" ..
+                 " (status=0); they are NOT cloud-controllable. Use local (python-kasa) or Matter control."
+        end
+        err("Passthrough API error -20571 (device offline / unreachable via cloud)" .. hint ..
+            " — endpoint=" .. base .. " deviceId=" .. g_deviceId)
+        C4:UpdateProperty("Status", "Error: device offline (-20571)")
+      else
+        err("Passthrough API error " .. tostring(resp.error_code))
+        C4:UpdateProperty("Status", "Error: API code " .. tostring(resp.error_code))
+      end
       return
     end
     if callback then
@@ -345,6 +564,45 @@ local function SendPassthrough(requestData, callback, isRetry)
       callback(inner)
     end
   end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Transport router — SMART devices with a LAN IP go local (KLAP); else cloud
+-- ---------------------------------------------------------------------------
+
+local function UseKlap()
+  return g_deviceType == "SMART" and g_localIp ~= ""
+end
+
+-- Wrap the SMART Build* output ({method,params}) as a KLAP request and send it.
+local function SendLocal(requestData, callback)
+  local inner = {
+    method             = requestData.method,
+    request_time_milis = 0,
+    terminal_uuid      = g_terminalUuid,
+  }
+  if requestData.params ~= nil then inner.params = requestData.params end
+  KlapRequest(toJson(inner), function(resp, kErr)
+    if not resp then
+      err("KLAP request failed: " .. tostring(kErr))
+      C4:UpdateProperty("Status", "Error: local KLAP (" .. tostring(kErr) .. ")")
+      return
+    end
+    if resp.error_code ~= nil and resp.error_code ~= 0 then
+      err("KLAP API error " .. tostring(resp.error_code))
+      C4:UpdateProperty("Status", "Error: KLAP code " .. tostring(resp.error_code))
+      return
+    end
+    if callback then callback(resp) end   -- full {error_code,result}; poll reads result.*
+  end)
+end
+
+local function Send(requestData, callback)
+  if UseKlap() then
+    SendLocal(requestData, callback)
+  else
+    SendPassthrough(requestData, callback)
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -404,14 +662,14 @@ end
 
 local function TurnOn()
   dbg("TurnOn")
-  SendPassthrough(BuildOnOff(true), function()
+  Send(BuildOnOff(true), function()
     UpdateProxy(true, g_isDimmer and g_currentLevel or 100)
   end)
 end
 
 local function TurnOff()
   dbg("TurnOff")
-  SendPassthrough(BuildOnOff(false), function()
+  Send(BuildOnOff(false), function()
     UpdateProxy(false, g_currentLevel)
   end)
 end
@@ -431,7 +689,7 @@ local function SetBrightness(level)
     return
   end
   dbg("SetBrightness " .. level)
-  SendPassthrough(BuildBrightness(level), function()
+  Send(BuildBrightness(level), function()
     UpdateProxy(true, level)
   end)
 end
@@ -442,7 +700,7 @@ end
 
 local function PollStatus()
   dbg("Polling status")
-  SendPassthrough(BuildGetStatus(), function(inner)
+  Send(BuildGetStatus(), function(inner)
     if not inner then return end
 
     local bOn, nLevel
@@ -507,6 +765,10 @@ local function DiscoverAccount()
     -- Fires OnWatchedVariableChanged immediately with the current values.
     C4:RegisterVariableListener(g_accountId, TOKEN_VAR_ID)
     C4:RegisterVariableListener(g_accountId, DEVLIST_VAR_ID)
+    C4:RegisterVariableListener(g_accountId, KLAP_HASH_VAR_ID)
+    -- Read KLAP hash directly too, in case the listener's initial fire is missed.
+    local kh = C4:GetDeviceVariable(g_accountId, KLAP_HASH_VAR_ID)
+    if type(kh) == "string" and kh ~= "" then g_klapAuthHash = hexToRaw(kh) end
     PopulateDeviceList()
     log("Found Kasa Account agent id=" .. g_accountId)
     return true
@@ -560,7 +822,8 @@ function OnPropertyChanged(strProperty)
   LoadConfig()
   if strProperty == "Poll Interval (sec)" then
     StartPollTimer()
-  elseif strProperty == "Device ID" or strProperty == "Device Type" or strProperty == "Is Dimmer" then
+  elseif strProperty == "Device ID" or strProperty == "Device Type"
+      or strProperty == "Is Dimmer" or strProperty == "Local IP (KLAP)" then
     PollStatus()
   end
 end
@@ -581,6 +844,10 @@ function OnWatchedVariableChanged(idDevice, idVariable, strValue)
     end
   elseif idVariable == DEVLIST_VAR_ID then
     PopulateDeviceList()
+  elseif idVariable == KLAP_HASH_VAR_ID then
+    g_klapAuthHash = hexToRaw(strValue or "")
+    g_klap = nil   -- credentials changed → force a fresh handshake
+    dbg("KLAP auth hash updated (raw len=" .. #g_klapAuthHash .. ")")
   end
 end
 

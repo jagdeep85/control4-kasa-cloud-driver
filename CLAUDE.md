@@ -22,7 +22,24 @@ Credentials live only on the account driver. Discovery is **by name** (no bindin
 
 ### Device-list dropdown
 
-The account driver caches the full device list (from `getDeviceList`) into variable ID **3002** as compact JSON (`{a=alias, i=id, t=IOT|SMART, d=dimmer, m=model}`), Base64-decoding SMART aliases and stripping commas. The light driver reads it and calls `C4:UpdatePropertyList("Select Device From List", "label1,label2,...")` to fill a `DYNAMIC_LIST` property. Selecting an entry (`OnPropertyChanged`) auto-fills **Device ID / Device Type / Is Dimmer** via `C4:UpdateProperty`. The account driver's "Refresh Device List" action re-fetches; the list also refreshes on each login.
+The account driver caches the full device list (from `getDeviceList`) into variable ID **3002** as compact JSON (`{a=alias, i=id, t=IOT|SMART, d=dimmer, m=model, u=appServerUrl}`), Base64-decoding SMART aliases and stripping commas. The light driver reads it and calls `C4:UpdatePropertyList("Select Device From List", "label1,label2,...")` to fill a `DYNAMIC_LIST` property. Selecting an entry (`OnPropertyChanged`) auto-fills **Device ID / Device Type / Is Dimmer** via `C4:UpdateProperty`. The account driver's "Refresh Device List" action re-fetches; the list also refreshes on each login.
+
+### Per-device endpoint (appServerUrl) — error -20571
+
+Kasa homes each device on a **regional cloud** returned as `appServerUrl` in `getDeviceList` (e.g. `use1-wap`, `aps1-wap`, `eu-wap`). Passthrough control MUST go to that per-device URL — hitting the wrong region returns **`error_code -20571` ("device offline")** even when the device is online in the app. The account driver caches `appServerUrl` as `u` in the 3002 list; the light driver's `ResolveAppServer()` matches its `Device ID` against the cached list and posts passthrough to `g_appServerUrl` (falling back to the hardcoded `API_URL = use1-wap` only if unresolved). After upgrading, the account driver must re-fetch the list (re-login or **Refresh Device List**) so the `u` field is populated.
+
+**KLAP devices (KS205 / KS225) are dead on the cloud — controlled via LOCAL KLAP instead.** On this account every KS205/KS225 comes back from `getDeviceList` with **`status=0`** (offline in the *legacy* cloud) while all HS-series + KS230 + KP405 return `status=1` and work. These newer switches moved to TP-Link's **SMART/KLAP** protocol and no longer maintain a legacy-cloud connection, so `passthrough` returns `-20571` regardless of endpoint/token/schema. It is **not** a region bug (all were `use1-wap`, `sameRegion=true`). The account driver logs a one-line `err()` warning per offline SMART device. **The driver now speaks KLAP locally** (see below) so these devices ARE controllable — set their LAN IP.
+
+### Local KLAP transport (KlapV2) — native, no bridge
+
+For SMART devices with a **`Local IP (KLAP)`** property set, the light driver talks the encrypted **KlapV2** protocol directly to the device on the LAN (port 80) instead of the cloud. Routing: `UseKlap() = (Device Type == "SMART" and Local IP ~= "")`; everything else keeps the cloud passthrough. The SMART `Build*()` payloads (`get_device_info` / `set_device_info`) are reused verbatim as the inner KLAP request — only the transport differs.
+
+- **Auth hash** — `auth_hash = SHA256(SHA1(user)..SHA1(pass))` is computed once by the **account driver** and published as hex on shared variable **3003**; the light driver reads it (never sees the plaintext password), `hexToRaw`s it into `g_klapAuthHash`, and re-handshakes whenever it changes.
+- **Handshake** — `POST /app/handshake1` (16-byte `local_seed`) → `remote_seed(16)+server_hash(32)` + `Set-Cookie: TP_SESSIONID` (the `TIMEOUT` cookie is dropped); verify `SHA256(local_seed..remote_seed..auth_hash)==server_hash`. `POST /app/handshake2` = `SHA256(remote_seed..local_seed..auth_hash)`. Then derive `key=SHA256("lsk"..)[1..16]`, `sig=SHA256("ldk"..)[1..28]`, `iv=SHA256("iv"..)[1..12]`, `seq=signedBE(SHA256("iv"..)[29..32])`.
+- **Request** — `seq++`; `iv_seq=iv..packBE32(seq)`; `ct=AES128CBC(key,iv_seq,pkcs7(json))`; body=`SHA256(sig..packBE32(seq)..ct)..ct`; `POST /app/request?seq=<seq>` with the session cookie. Response = `sig(32)..ct` → AES-decrypt → `{"error_code":0,"result":{device_on,brightness}}`. HTTP **403** ⇒ session expired: clear `g_klap`, re-handshake once, retry.
+- **Crypto** uses `C4:Hash`/`C4:Encrypt`/`C4:Decrypt` (all `*_encoding="NONE"` for raw bytes, `padding=false` — PKCS7 done in Lua). BE32 (un)packing is arithmetic (no `string.pack`) so it runs on Lua 5.1 and 5.3. `randBytes` derives the seed from hashed `os.time`/`os.clock`/`math.random`.
+- Only **KlapV2** is implemented (KS205/KS225). If `server_hash` never matches, the device may be KlapV1 (MD5-based) — not yet supported.
+- **Prereq:** the device needs a reserved LAN IP entered in `Local IP (KLAP)`. `getDeviceList` does not return the local IP, so it's manual (UDP-20002 discovery is a possible future add).
 
 ## C4 API notes
 

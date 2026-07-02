@@ -17,6 +17,7 @@ local AUTH_URL     = "https://wap.tplinkcloud.com"
 local TERM_UUID    = "c4-kasa-account-v1"
 local TOKEN_VAR_ID = 3001          -- shared token variable; light drivers read this ID
 local DEVLIST_VAR_ID = 3002        -- shared device-list JSON; light drivers read this ID
+local KLAP_HASH_VAR_ID = 3003      -- shared KLAP auth hash (hex) for local control of SMART devices
 local REFRESH_TIMER = 1
 
 local DIMMER_MODELS = { "HS220", "KS225", "KS230", "KP405" }
@@ -239,6 +240,31 @@ local function LoadConfig()
 end
 
 -- ---------------------------------------------------------------------------
+-- KLAP auth hash — shared with light drivers for LOCAL control of SMART
+-- (KS205/KS225) devices, which cannot be reached via the cloud passthrough.
+-- KlapV2: auth_hash = SHA256( SHA1(username) .. SHA1(password) ).
+-- We publish only the hash (hex) so light drivers never touch the plaintext password.
+-- ---------------------------------------------------------------------------
+
+local function PublishKlapHash()
+  if g_username == "" or g_password == "" then
+    C4:SetVariable(KLAP_HASH_VAR_ID, "")
+    return
+  end
+  local ok, hex = pcall(function()
+    local u = C4:Hash("SHA1", g_username, { data_encoding = "NONE", return_encoding = "NONE" })
+    local p = C4:Hash("SHA1", g_password, { data_encoding = "NONE", return_encoding = "NONE" })
+    return C4:Hash("SHA256", u .. p, { data_encoding = "NONE", return_encoding = "HEX" })
+  end)
+  if ok and type(hex) == "string" and hex ~= "" then
+    C4:SetVariable(KLAP_HASH_VAR_ID, hex)
+    dbg("Published KLAP auth hash (len=" .. #hex .. ")")
+  else
+    err("Failed to compute KLAP auth hash: " .. tostring(hex))
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Login — publishes token into the shared variable
 -- ---------------------------------------------------------------------------
 
@@ -305,12 +331,23 @@ function FetchDeviceList()
         alias = b64decode(alias) or alias
       end
       alias = alias:gsub(",", " ")   -- commas break the comma-delimited dropdown list
+      dbg("device '" .. tostring(alias) .. "' model=" .. tostring(d.deviceModel) ..
+          " status=" .. tostring(d.status) .. " region=" .. tostring(d.deviceRegion) ..
+          " sameRegion=" .. tostring(d.isSameRegion) .. " appServerUrl=" .. tostring(d.appServerUrl))
+      -- KS205/KS225 (KLAP firmware) drop off the legacy cloud and report status=0;
+      -- the passthrough API cannot reach them. Flag it once so the installer knows.
+      if dtype == "SMART" and tonumber(d.status) == 0 then
+        err("'" .. tostring(alias) .. "' (" .. tostring(d.deviceModel) ..
+            ") is offline in the legacy Kasa cloud (status=0) — likely KLAP firmware, " ..
+            "NOT controllable via cloud passthrough. Needs local (python-kasa) or Matter control.")
+      end
       out[#out + 1] = {
         a = alias,
         i = d.deviceId,
         t = dtype,
         d = IsDimmerModel(d.deviceModel or "") and 1 or 0,
         m = d.deviceModel or "",
+        u = d.appServerUrl or "",   -- per-device regional endpoint for passthrough
       }
     end
     C4:SetVariable(DEVLIST_VAR_ID, toJson(out))  -- notifies bound light drivers
@@ -341,12 +378,14 @@ end
 function OnDriverInit()
   -- Variables MUST be added in OnDriverInit. Fixed IDs so light drivers can
   -- read them via C4:GetDeviceVariable(accountId, id) without discovery.
-  C4:AddVariable(TOKEN_VAR_ID, "", "STRING", true, false)     -- 3001 token
-  C4:AddVariable(DEVLIST_VAR_ID, "", "STRING", true, false)   -- 3002 device list JSON
+  C4:AddVariable(TOKEN_VAR_ID, "", "STRING", true, false)      -- 3001 token
+  C4:AddVariable(DEVLIST_VAR_ID, "", "STRING", true, false)    -- 3002 device list JSON
+  C4:AddVariable(KLAP_HASH_VAR_ID, "", "STRING", true, false)  -- 3003 KLAP auth hash (hex)
 end
 
 function OnDriverLateInit()
   LoadConfig()
+  PublishKlapHash()   -- local-control hash for SMART devices (independent of cloud login)
   DoLogin()
   StartRefreshTimer()
 end
@@ -360,6 +399,7 @@ function OnPropertyChanged(strProperty)
   if strProperty == "Kasa Username" or strProperty == "Kasa Password" then
     C4:UpdateProperty("Token", "")
     C4:SetVariable(TOKEN_VAR_ID, "")
+    PublishKlapHash()   -- creds changed → refresh local-control hash too
     DoLogin()
   elseif strProperty == "Token Refresh (hrs)" then
     StartRefreshTimer()

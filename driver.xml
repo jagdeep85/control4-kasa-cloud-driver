@@ -7,7 +7,7 @@
   <driver>DriverWorks</driver>
   <control>lua_gen</control>
   <controlmethod>ip</controlmethod>
-  <version>12</version>
+  <version>16</version>
   <created>2026-06-30</created>
   <modified>2026-07-01T12:00:00</modified>
   <minimum_os_version>3.3.0</minimum_os_version>
@@ -59,6 +59,12 @@
         </items>
         <default>No</default>
         <description>Set to Yes for HS220, KS225, KS230, KP405 and similar dimmers</description>
+      </property>
+      <property>
+        <name>Local IP (KLAP)</name>
+        <type>STRING</type>
+        <default></default>
+        <description>LAN IP of a SMART device (KS205/KS225) for LOCAL control via the encrypted KLAP protocol. These devices are dead on the Kasa cloud (error -20571); set their reserved IP here to control them locally. Leave blank for IOT (HS/KP/KS230) devices, which use the cloud. Use a DHCP reservation so the IP doesn't change.</description>
       </property>
 
       <!-- Polling -->

@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="utf-8"?>
+<devicedata>
+  <name>TP-Link Kasa Cloud Switch</name>
+  <creator>Jagdeep Matharu</creator>
+  <manufacturer>TP-Link</manufacturer>
+  <model>Kasa Cloud</model>
+  <driver>DriverWorks</driver>
+  <control>lua_gen</control>
+  <controlmethod>ip</controlmethod>
+  <version>11</version>
+  <created>2026-06-30</created>
+  <modified>2026-07-01T12:00:00</modified>
+  <minimum_os_version>3.3.0</minimum_os_version>
+  <description>Controls a single TP-Link Kasa device (switch or dimmer) via the Kasa Cloud API. Supports both IOT.SMARTPLUGSWITCH (HS/KP-series) and SMART.KASASWITCH (KS-series) device types.</description>
+  <composer_categories>
+    <category>Lighting</category>
+  </composer_categories>
+
+  <proxies qty="1">
+    <proxy proxybindingid="5001" name="Kasa Light">light_v2</proxy>
+  </proxies>
+
+  <states />
+
+  <config>
+    <script file="driver.lua" jit="1"/>
+
+    <properties>
+
+      <!-- Device -->
+      <property>
+        <name>Select Device From List</name>
+        <type>DYNAMIC_LIST</type>
+        <readonly>false</readonly>
+        <description>Pick a Kasa device (populated from the Kasa Account driver). Selecting one auto-fills Device ID, Device Type, and Is Dimmer.</description>
+      </property>
+      <property>
+        <name>Device ID</name>
+        <type>STRING</type>
+        <default></default>
+        <description>deviceId from the Kasa device list (40-char hex string)</description>
+      </property>
+      <property>
+        <name>Device Type</name>
+        <type>LIST</type>
+        <items>
+          <item>IOT</item>
+          <item>SMART</item>
+        </items>
+        <default>IOT</default>
+        <description>IOT = HS/KP/KS230-series; SMART = KS205/KS225-series</description>
+      </property>
+      <property>
+        <name>Is Dimmer</name>
+        <type>LIST</type>
+        <items>
+          <item>No</item>
+          <item>Yes</item>
+        </items>
+        <default>No</default>
+        <description>Set to Yes for HS220, KS225, KS230, KP405 and similar dimmers</description>
+      </property>
+
+      <!-- Polling -->
+      <property>
+        <name>Poll Interval (sec)</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>10</minimum>
+        <maximum>300</maximum>
+        <default>60</default>
+        <description>How often to poll the device for status updates</description>
+      </property>
+
+      <!-- Status (readonly) -->
+      <property>
+        <name>Status</name>
+        <type>STRING</type>
+        <default>Not initialized</default>
+        <readonly>true</readonly>
+        <description>Last known device state</description>
+      </property>
+
+      <!-- Debug -->
+      <property>
+        <name>Debug</name>
+        <type>LIST</type>
+        <items>
+          <item>Off</item>
+          <item>On</item>
+        </items>
+        <default>Off</default>
+        <description>Enable verbose logging to Control4 log</description>
+      </property>
+
+    </properties>
+
+    <commands>
+      <command>
+        <name>ON</name>
+        <description>Turn the device on</description>
+      </command>
+      <command>
+        <name>OFF</name>
+        <description>Turn the device off</description>
+      </command>
+      <command>
+        <name>SET_BRIGHTNESS_TARGET</name>
+        <description>Set brightness level</description>
+        <params>
+          <param>
+            <name>LIGHT</name>
+            <type>NUMBER</type>
+          </param>
+        </params>
+      </command>
+      <command>
+        <name>RAMP_TO_LEVEL</name>
+        <description>Ramp to brightness level</description>
+        <params>
+          <param>
+            <name>LIGHT</name>
+            <type>NUMBER</type>
+          </param>
+          <param>
+            <name>TIME</name>
+            <type>NUMBER</type>
+          </param>
+        </params>
+      </command>
+      <command>
+        <name>REFRESH</name>
+        <description>Force a status poll immediately</description>
+      </command>
+      <command>
+        <name>PRINT_STATUS</name>
+        <description>Print current device status to the Control4 log</description>
+      </command>
+    </commands>
+
+    <actions>
+      <action>
+        <name>Turn On</name>
+        <command>ON</command>
+      </action>
+      <action>
+        <name>Turn Off</name>
+        <command>OFF</command>
+      </action>
+      <action>
+        <name>Print Status</name>
+        <command>PRINT_STATUS</command>
+      </action>
+      <action>
+        <name>Refresh Status</name>
+        <command>REFRESH</command>
+      </action>
+    </actions>
+
+  </config>
+
+  <connections>
+    <connection>
+      <id>5001</id>
+      <facing>6</facing>
+      <connectionname>Light</connectionname>
+      <type>2</type>
+      <consumer>False</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>False</linelevel>
+      <classes>
+        <class>
+          <classname>LIGHT_V2</classname>
+        </class>
+      </classes>
+    </connection>
+  </connections>
+
+  <capabilities>
+    <supports_target>true</supports_target>
+    <on_off>true</on_off>
+    <dimmer>true</dimmer>
+    <load_group_support>true</load_group_support>
+    <set_level>true</set_level>
+    <ramp_level>true</ramp_level>
+    <advanced_scene_support>true</advanced_scene_support>
+    <click_rates>False</click_rates>
+    <hold_rates>False</hold_rates>
+  </capabilities>
+
+  <events></events>
+
+  <copyright>Jagdeep Matharu 2026</copyright>
+
+</devicedata>

@@ -1,0 +1,12 @@
+# Local / sensitive — never commit
+devices.json
+*.token
+.env
+.claude/
+
+# Third-party commercial drivers (do not redistribute)
+extracted_light/
+
+# Build scratch
+build_account/
+tmp*.zip

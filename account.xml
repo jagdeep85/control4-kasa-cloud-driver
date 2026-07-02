@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<devicedata>
+  <name>TP-Link Kasa Account</name>
+  <creator>Jagdeep Matharu</creator>
+  <manufacturer>TP-Link</manufacturer>
+  <model>Kasa Account</model>
+  <driver>DriverWorks</driver>
+  <control>lua_gen</control>
+  <controlmethod>ip</controlmethod>
+  <version>6</version>
+  <created>2026-07-01</created>
+  <modified>2026-07-01T12:00:00</modified>
+  <minimum_os_version>3.3.0</minimum_os_version>
+  <description>Holds TP-Link Kasa Cloud credentials once for the whole project and shares the auth token + device list with all Kasa light drivers. Loaded via the Agents panel; light drivers discover it by name.</description>
+  <composer_categories>
+    <category>Other</category>
+  </composer_categories>
+
+  <config>
+    <script file="account.lua" jit="1"/>
+
+    <properties>
+      <property>
+        <name>Kasa Username</name>
+        <type>STRING</type>
+        <default></default>
+        <description>TP-Link account email address (case-sensitive)</description>
+      </property>
+      <property>
+        <name>Kasa Password</name>
+        <type>STRING</type>
+        <default></default>
+        <description>TP-Link account password</description>
+        <password>true</password>
+      </property>
+      <property>
+        <name>Token</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+        <description>Cached auth token — managed automatically</description>
+      </property>
+      <property>
+        <name>Token Refresh (hrs)</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>1</minimum>
+        <maximum>168</maximum>
+        <default>12</default>
+        <description>How often to re-login and refresh the shared token</description>
+      </property>
+      <property>
+        <name>Devices Cached</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+        <description>Number of Kasa devices cached for the light-driver dropdown</description>
+      </property>
+      <property>
+        <name>Status</name>
+        <type>STRING</type>
+        <default>Not initialized</default>
+        <readonly>true</readonly>
+        <description>Login status</description>
+      </property>
+      <property>
+        <name>Debug</name>
+        <type>LIST</type>
+        <items>
+          <item>Off</item>
+          <item>On</item>
+        </items>
+        <default>Off</default>
+        <description>Enable verbose logging</description>
+      </property>
+    </properties>
+
+    <commands>
+      <command>
+        <name>RELOGIN</name>
+        <description>Force a fresh login and republish the token</description>
+      </command>
+      <command>
+        <name>REFRESH_DEVICES</name>
+        <description>Re-fetch and cache the Kasa device list</description>
+      </command>
+    </commands>
+
+    <actions>
+      <action>
+        <name>Login Now</name>
+        <command>Login Now</command>
+      </action>
+      <action>
+        <name>Refresh Device List</name>
+        <command>Refresh Device List</command>
+      </action>
+    </actions>
+
+  </config>
+
+  <combo>true</combo>
+  <proxies>
+    <proxy>kasa_account</proxy>
+  </proxies>
+  <events></events>
+
+  <copyright>Jagdeep Matharu 2026</copyright>
+
+</devicedata>

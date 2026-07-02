@@ -1,6 +1,8 @@
 # TP-Link Kasa Cloud — Control4 DriverWorks Drivers
 
-Control4 OS3.3+ drivers that control **TP-Link Kasa** switches and dimmers through the **Kasa Cloud API** (no local LAN control required). The system is split into two cooperating drivers so you enter your Kasa credentials **once** and every light shares them.
+Control4 OS3.3+ drivers that control **TP-Link Kasa** switches and dimmers. Older Kasa devices (HS/KP/KS230) are driven through the **Kasa Cloud API**; newer **SMART** switches (KS205/KS225) — which dropped off the legacy cloud — are driven **locally over the encrypted KLAP protocol**. The system is split into two cooperating drivers so you enter your Kasa credentials **once** and every light shares them.
+
+> **v1.1** adds native **local KLAP** control for KS205/KS225 (see §3.1), per-device cloud endpoint routing (fixes error `-20571`), and remote **Bulb**-button (`BUTTON_ACTION`) handling for Neeo/Halo remotes.
 
 | File (source) | Packaged `.c4z` | Role |
 |---|---|---|
@@ -52,7 +54,8 @@ A **combo self-proxy device** (like Control4's `generic_http` sample). It has no
 ### What it does
 - On startup, reads **Kasa Username / Password** from its properties and calls `login`.
 - Publishes the returned **token** into Control4 variable **ID 3001**.
-- Fetches `getDeviceList` and publishes a compact JSON list into variable **ID 3002** (Base64-decoding the KS-series aliases, so light drivers can offer a device dropdown).
+- Fetches `getDeviceList` and publishes a compact JSON list into variable **ID 3002** (Base64-decoding the KS-series aliases and caching each device's regional `appServerUrl`, so light drivers can offer a device dropdown and reach the right cloud endpoint).
+- Computes the **KLAP auth hash** `SHA256(SHA1(user)..SHA1(pass))` and publishes it (hex) into variable **ID 3003**, so light drivers can control local KLAP devices without ever seeing the plaintext password.
 - Re-logs in on a timer (**Token Refresh (hrs)**, default 12h) so the token never goes stale.
 - Responds to a `RELOGIN` command (sent by a light driver whose token expired) by logging in again and re-publishing the token.
 
@@ -88,6 +91,7 @@ One instance **per physical Kasa device**. It implements the Control4 **`light_v
 | Device ID | 40-char hex device ID (auto-filled) |
 | Device Type | `IOT` (HS/KP/KS230) or `SMART` (KS205/KS225) (auto-filled) |
 | Is Dimmer | `Yes`/`No` (auto-filled; auto-detected from status too) |
+| Local IP (KLAP) | LAN IP of a **SMART** device for local KLAP control — see §3.1. Blank = cloud |
 | Poll Interval (sec) | Status refresh cadence (10–300) |
 | Status | Readonly — last known on/off + brightness |
 | Debug | Verbose logging |
@@ -102,6 +106,39 @@ Kasa exposes two different command shapes. `Device Type` selects which the drive
 | Status | `system.get_sysinfo` | `get_device_info` |
 
 > **Note:** KS230 3-way dimmers report as `IOT.SMARTPLUGSWITCH` — set them to **IOT**, not SMART.
+
+---
+
+## 3.1 Local KLAP control (KS205 / KS225)
+
+Newer Kasa **SMART** switches (KS205 switch, KS225 dimmer) moved to TP-Link's encrypted **KLAP** protocol and **no longer connect to the legacy Kasa cloud**. `getDeviceList` returns them with `status=0`, and any cloud `passthrough` returns **`error_code -20571` ("Device is offline")** — regardless of token, region, or schema. This is not a bug in the account; it's a device-firmware change (confirmed: every KS205/KS225 is `status=0` while all HS-series + KS230 + KP405 are `status=1`).
+
+To control them, the light driver speaks **KlapV2 directly to the device on your LAN** — no cloud, no external bridge:
+
+1. Add the light driver for the KS205/KS225 as usual and pick it from the dropdown (Device Type auto-fills to `SMART`).
+2. Give the device a **reserved/static LAN IP** on your router (DHCP reservation).
+3. Enter that IP in the **Local IP (KLAP)** property.
+
+The driver then handshakes with the device (using the KLAP auth hash from the account driver's variable 3003), derives an AES-128-CBC session, and sends the same on/off/brightness/status commands over the encrypted local channel. Sessions auto-recover (re-handshake) if the device reboots.
+
+```mermaid
+graph TD
+    subgraph LAN["🏠 Local LAN"]
+        SW["🔌 KS205 / KS225<br/>(KLAP, port 80)"]
+    end
+    subgraph C4["Control4 Director"]
+        ACC["🔑 Kasa Account driver"]
+        L["💡 Kasa Light (SMART + Local IP)"]
+    end
+    ACC -. "auth hash (var 3003)" .-> L
+    L -- "handshake1/2 → AES session" --> SW
+    L -- "/app/request (encrypted on/off/level)" --> SW
+    SW -- "encrypted {device_on, brightness}" --> L
+```
+
+- **Routing:** a light uses local KLAP only when **Device Type = SMART *and* Local IP is set**. Everything else (and any SMART device with a blank IP) uses the cloud path unchanged.
+- **Requirement:** only **KlapV2** devices are supported (KS205/KS225). The device needs a reserved IP; `getDeviceList` does not report the local IP, so it's entered manually.
+- **Security:** the light driver never receives the plaintext password — only the auth hash on variable 3003.
 
 ---
 
@@ -148,20 +185,25 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    P["light_v2 proxy"] -->|SET_BRIGHTNESS_TARGET / TOGGLE / ON / OFF| RFP["ReceivedFromProxy"]
+    P["light_v2 proxy"] -->|"SET_BRIGHTNESS_TARGET / TOGGLE / BUTTON_ACTION"| RFP["ReceivedFromProxy"]
     RFP --> EC["ExecuteCommand"] --> DC["DispatchCommand"]
     DC -->|"level > 0"| SB["SetBrightness"]
     DC -->|"level = 0"| OFF["TurnOff"]
-    DC -->|TOGGLE| TG{"g_currentOn?"}
+    DC -->|TOGGLE / BUTTON_ACTION| TG{"g_currentOn?"}
     TG -->|on| OFF
     TG -->|off| ON["TurnOn"]
-    SB --> SP["SendPassthrough (token)"]
-    ON --> SP
-    OFF --> SP
-    SP --> UP["UpdateProxy → LIGHT_BRIGHTNESS_CHANGED"]
+    SB --> SND["Send()"]
+    ON --> SND
+    OFF --> SND
+    SND -->|"SMART + Local IP"| KL["KLAP (local, encrypted)"]
+    SND -->|"otherwise"| SP["SendPassthrough (cloud token)"]
+    KL --> UP["UpdateProxy → LIGHT_BRIGHTNESS_CHANGED"]
+    SP --> UP
 ```
 
 > **Important:** the `light_v2` proxy has **no `ON`/`OFF` command**. The navigator's on/off toggle arrives as `SET_BRIGHTNESS_TARGET 0` (off) or a `TOGGLE`. Brightness `0` is routed to a real relay-off, not `set_brightness:0` (which would leave an IOT dimmer on at minimum).
+>
+> **Remotes:** Neeo/Halo remotes and keypads send the **Bulb** press as `BUTTON_ACTION` (`BUTTON_ID` 0=on/1=off/2=toggle, acted on release), not `SET_BRIGHTNESS_TARGET` — the driver handles both so the remote and the app stay in sync.
 
 ---
 
@@ -183,7 +225,8 @@ graph LR
 2. Drag **TP-Link Kasa Cloud Switch** into the room where the light lives.
 3. Select it → open **Select Device From List** → pick the device (e.g. `Basement 02 (KS230(US))`).
    - This auto-fills **Device ID**, **Device Type**, and **Is Dimmer**.
-4. Repeat for each physical device.
+4. **KS205/KS225 only:** set **Local IP (KLAP)** to that device's reserved LAN IP (see §3.1). Other models leave it blank.
+5. Repeat for each physical device.
 
 ### Step 4 — Assign to rooms / navigators
 Add each light to its room's lighting (Composer handles this once the `light_v2` proxy is bound). The dimmer/switch now appears in the app.
@@ -208,6 +251,9 @@ graph TD
 | Commands do nothing | Enable **Debug** on both drivers; confirm the Account **Status** shows a valid token |
 | Wrong on/off behavior | Ensure **Device Type** matches the hardware (KS230 = IOT, not SMART) |
 | Brightness slider resets to 0 | Old issue — driver must send `LIGHT_BRIGHTNESS_CHANGED` (fixed in current build) |
+| `-20571` / "Device is offline" on a KS205/KS225 | Expected — these are cloud-dead SMART devices. Set **Local IP (KLAP)** to control them locally (§3.1) |
+| KLAP device unresponsive | Verify the **Local IP (KLAP)** is correct/reserved and the device is on the same subnet as the controller; enable **Debug** and check the handshake sequence |
+| Remote **Bulb** button does nothing (app works) | Update to the current light driver — it handles `BUTTON_ACTION` |
 
 Enable **Debug = On** on either driver to trace logins, HTTP calls, and proxy commands in the Control4 director log.
 

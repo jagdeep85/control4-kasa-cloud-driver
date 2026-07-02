@@ -7,7 +7,7 @@
   <driver>DriverWorks</driver>
   <control>lua_gen</control>
   <controlmethod>ip</controlmethod>
-  <version>16</version>
+  <version>17</version>
   <created>2026-06-30</created>
   <modified>2026-07-01T12:00:00</modified>
   <minimum_os_version>3.3.0</minimum_os_version>
@@ -64,7 +64,7 @@
         <name>Local IP (KLAP)</name>
         <type>STRING</type>
         <default></default>
-        <description>LAN IP of a SMART device (KS205/KS225) for LOCAL control via the encrypted KLAP protocol. These devices are dead on the Kasa cloud (error -20571); set their reserved IP here to control them locally. Leave blank for IOT (HS/KP/KS230) devices, which use the cloud. Use a DHCP reservation so the IP doesn't change.</description>
+        <description>LAN IP of a SMART device (KS205/KS225) for LOCAL control via the encrypted KLAP protocol. These devices are dead on the Kasa cloud (error -20571); local control reaches them directly. Auto-filled by the account driver's UDP discovery when the device is on the same subnet — or enter it manually (a manual value is never overwritten). Leave blank for IOT (HS/KP/KS230) devices, which use the cloud. Use a DHCP reservation so the IP doesn't change.</description>
       </property>
 
       <!-- Polling -->

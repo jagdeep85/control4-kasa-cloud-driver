@@ -7,7 +7,7 @@
   <driver>DriverWorks</driver>
   <control>lua_gen</control>
   <controlmethod>ip</controlmethod>
-  <version>10</version>
+  <version>11</version>
   <created>2026-07-01</created>
   <modified>2026-07-01T12:00:00</modified>
   <minimum_os_version>3.3.0</minimum_os_version>
@@ -93,6 +93,10 @@
       <action>
         <name>Refresh Device List</name>
         <command>Refresh Device List</command>
+      </action>
+      <action>
+        <name>Discover Local IPs</name>
+        <command>Discover Local IPs</command>
       </action>
     </actions>
 

@@ -71,6 +71,7 @@ A **combo self-proxy device** (like Control4's `generic_http` sample). It has no
 ### Actions
 - **Login Now** — force an immediate re-login
 - **Refresh Device List** — re-fetch the device list
+- **Discover Local IPs** — UDP-broadcast to find KS205/KS225 LAN IPs for local KLAP control (§3.1)
 
 ---
 
@@ -117,9 +118,11 @@ To control them, the light driver speaks **KlapV2 directly to the device on your
 
 1. Add the light driver for the KS205/KS225 as usual and pick it from the dropdown (Device Type auto-fills to `SMART`).
 2. Give the device a **reserved/static LAN IP** on your router (DHCP reservation).
-3. Enter that IP in the **Local IP (KLAP)** property.
+3. The **Local IP (KLAP)** property is **auto-filled by UDP discovery** (see below) — or enter the IP manually. A manual value is never overwritten.
 
 The driver then handshakes with the device (using the KLAP auth hash from the account driver's variable 3003), derives an AES-128-CBC session, and sends the same on/off/brightness/status commands over the encrypted local channel. Sessions auto-recover (re-handshake) if the device reboots.
+
+**Auto-discovery of IPs.** The account driver broadcasts a Kasa discovery query on UDP `20002` and learns each SMART device's LAN IP, publishing it in the shared device list. Light drivers then auto-fill **Local IP (KLAP)** for their device. It runs automatically after each device-list fetch, and on demand via the account driver's **Discover Local IPs** action. Discovery is broadcast-based, so the device and the Control4 controller must be on the **same subnet/VLAN**; otherwise enter the IP manually.
 
 ```mermaid
 graph TD
@@ -225,7 +228,7 @@ graph LR
 2. Drag **TP-Link Kasa Cloud Switch** into the room where the light lives.
 3. Select it → open **Select Device From List** → pick the device (e.g. `Basement 02 (KS230(US))`).
    - This auto-fills **Device ID**, **Device Type**, and **Is Dimmer**.
-4. **KS205/KS225 only:** set **Local IP (KLAP)** to that device's reserved LAN IP (see §3.1). Other models leave it blank.
+4. **KS205/KS225 only:** **Local IP (KLAP)** is auto-filled by discovery (§3.1). If the device is on a different subnet, set it manually. Other models leave it blank.
 5. Repeat for each physical device.
 
 ### Step 4 — Assign to rooms / navigators

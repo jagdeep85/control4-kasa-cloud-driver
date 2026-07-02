@@ -398,6 +398,20 @@ local function ResolveAppServer()
   dbg("Device " .. g_deviceId .. " not in cached list yet — appServerUrl unresolved")
 end
 
+-- Auto-fill Local IP (KLAP) for SMART devices from the account's UDP discovery
+-- (field `p`). Only when the property is blank — a manually entered IP always wins.
+local function AutoFillLocalIp()
+  if g_deviceType ~= "SMART" or g_deviceId == "" then return end
+  if (Properties["Local IP (KLAP)"] or "") ~= "" then return end
+  for _, d in ipairs(g_deviceList) do
+    if tostring(d.i) == g_deviceId and type(d.p) == "string" and d.p ~= "" then
+      C4:UpdateProperty("Local IP (KLAP)", d.p)   -- fires OnPropertyChanged → LoadConfig → poll
+      log("Auto-filled Local IP (KLAP) = " .. d.p .. " from discovery")
+      return
+    end
+  end
+end
+
 local function LoadConfig()
   g_deviceId     = Properties["Device ID"]         or ""
   g_deviceType   = Properties["Device Type"]       or "IOT"
@@ -488,6 +502,7 @@ local function PopulateDeviceList()
     dbg("Populated device dropdown — " .. #aliases .. " devices")
   end
   ResolveAppServer()   -- list just refreshed — pick up this device's endpoint
+  AutoFillLocalIp()    -- and its discovered LAN IP (SMART/KLAP), if any
 end
 
 -- Apply the device the installer picked in the dropdown to the real properties.

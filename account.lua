@@ -19,8 +19,14 @@ local TOKEN_VAR_ID = 3001          -- shared token variable; light drivers read 
 local DEVLIST_VAR_ID = 3002        -- shared device-list JSON; light drivers read this ID
 local KLAP_HASH_VAR_ID = 3003      -- shared KLAP auth hash (hex) for local control of SMART devices
 local REFRESH_TIMER = 1
+local DISCOVER_TIMER = 2
 
 local DIMMER_MODELS = { "HS220", "KS225", "KS230", "KP405" }
+
+-- UDP discovery of SMART-device LAN IPs (KLAP local control)
+local DISC_BINDING = 6001                  -- runtime UDP network connection id (WoL-style, no XML)
+local DISC_PORT    = 20002                 -- Kasa SMART/KLAP discovery port
+local DISC_MAGIC   = "020000010000000000000000463cb5d3"  -- fixed 16-byte query (hex)
 
 -- ---------------------------------------------------------------------------
 -- State
@@ -31,6 +37,10 @@ local g_password  = ""
 local g_token     = ""
 local g_refreshHrs = 12
 local g_debug     = false
+
+local g_lastList   = nil    -- last device list built by FetchDeviceList (for IP merge)
+local g_discovered = {}      -- normalized device_id / mac -> LAN IP (from UDP discovery)
+local g_discNetUp  = false   -- UDP connection created?
 
 -- ---------------------------------------------------------------------------
 -- Logging
@@ -199,6 +209,86 @@ local function b64decode(data)
 end
 
 -- ---------------------------------------------------------------------------
+-- UDP discovery of SMART-device LAN IPs (for KLAP local control)
+-- ---------------------------------------------------------------------------
+-- KS205/KS225 answer a broadcast on UDP 20002 with a 16-byte header + plaintext
+-- JSON carrying device_id + ip. We broadcast the fixed magic packet, collect the
+-- replies, and merge each IP into the shared device list (var 3002, field `p`).
+-- Uses the WoL-style runtime UDP connection (no XML <connections> binding).
+
+local function hexToRaw(hex)
+  return (tostring(hex):gsub("%x%x", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+-- Normalize a device_id/MAC for matching: lowercase, strip ':' and '-'.
+local function normKey(s)
+  return (tostring(s or ""):gsub("[:%-]", ""):lower())
+end
+
+local function EnsureDiscoveryNet()
+  if g_discNetUp then return end
+  -- Guarded: a UDP-API failure on this controller must not break login/token/hash.
+  local ok, e = pcall(function()
+    C4:CreateNetworkConnection(DISC_BINDING, "255.255.255.255")
+    C4:NetConnect(DISC_BINDING, DISC_PORT, "UDP")
+  end)
+  if ok then
+    g_discNetUp = true
+    dbg("UDP discovery connection up (binding " .. DISC_BINDING .. " → 255.255.255.255:" .. DISC_PORT .. ")")
+  else
+    err("UDP discovery setup failed (falling back to manual Local IP): " .. tostring(e))
+  end
+end
+
+-- Fold collected IPs into the cached list and re-publish var 3002.
+local function MergeDiscovered()
+  if type(g_lastList) ~= "table" then return end
+  local n = 0
+  for _, e in ipairs(g_lastList) do
+    local ip = g_discovered[normKey(e.i)]
+    if ip and ip ~= "" and e.p ~= ip then e.p = ip; n = n + 1 end
+  end
+  if n > 0 then
+    C4:SetVariable(DEVLIST_VAR_ID, toJson(g_lastList))
+  end
+  log("Discovery merge — " .. n .. " local IP(s) added to device list")
+  C4:UpdateProperty("Status", "Discovered local IPs: " .. n)
+end
+
+-- Broadcast the discovery query; collect replies for ~2.5s, then merge.
+local function DiscoverLocalIps()
+  EnsureDiscoveryNet()
+  if not g_discNetUp then return end
+  g_discovered = {}
+  dbg("Broadcasting KLAP discovery to 255.255.255.255:" .. DISC_PORT)
+  local ok, e = pcall(function()
+    C4:SendToNetwork(DISC_BINDING, DISC_PORT, hexToRaw(DISC_MAGIC))
+  end)
+  if not ok then err("Discovery broadcast failed: " .. tostring(e)); return end
+  C4:KillTimer(DISCOVER_TIMER)
+  C4:SetTimer(2500, function() MergeDiscovered() end, false, DISCOVER_TIMER)
+end
+
+-- Director delivers UDP datagrams here. Parse device_id + ip from the reply.
+function ReceivedFromNetwork(idBinding, nPort, strData)
+  if idBinding ~= DISC_BINDING then return end
+  if type(strData) ~= "string" or #strData <= 16 then
+    dbg("Discovery RX ignored (len=" .. tostring(strData and #strData) .. ")")
+    return
+  end
+  local t = fromJson(strData:sub(17))         -- skip 16-byte header
+  local r = t and t.result
+  if type(r) == "table" and r.device_id and r.ip then
+    g_discovered[normKey(r.device_id)] = r.ip
+    if r.mac then g_discovered[normKey(r.mac)] = r.ip end
+    dbg("Discovery RX: " .. tostring(r.device_model) .. " id=" .. tostring(r.device_id) ..
+        " ip=" .. tostring(r.ip))
+  else
+    dbg("Discovery RX unparsed (len=" .. #strData .. ")")
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- HTTP helper
 -- ---------------------------------------------------------------------------
 
@@ -350,9 +440,11 @@ function FetchDeviceList()
         u = d.appServerUrl or "",   -- per-device regional endpoint for passthrough
       }
     end
+    g_lastList = out                             -- cached so discovery can merge IPs in
     C4:SetVariable(DEVLIST_VAR_ID, toJson(out))  -- notifies bound light drivers
     C4:UpdateProperty("Devices Cached", tostring(#out))
     log("Device list cached — " .. #out .. " devices")
+    DiscoverLocalIps()                           -- find SMART-device LAN IPs (KLAP)
   end)
 end
 
@@ -386,12 +478,14 @@ end
 function OnDriverLateInit()
   LoadConfig()
   PublishKlapHash()   -- local-control hash for SMART devices (independent of cloud login)
+  EnsureDiscoveryNet()  -- open the UDP socket early so the first broadcast is ready
   DoLogin()
   StartRefreshTimer()
 end
 
 function OnDriverDestroyed()
   C4:KillTimer(REFRESH_TIMER)
+  C4:KillTimer(DISCOVER_TIMER)
 end
 
 function OnPropertyChanged(strProperty)
@@ -415,12 +509,16 @@ function ExecuteCommand(strCommand, tParams)
     DoLogin()
   elseif strCommand == "REFRESH_DEVICES" then
     FetchDeviceList()
+  elseif strCommand == "DISCOVER_IPS" then
+    DiscoverLocalIps()
   elseif strCommand == "LUA_ACTION" then
     local action = tParams and tParams["ACTION"] or ""
     if action == "Login Now" then
       DoLogin()
     elseif action == "Refresh Device List" then
       FetchDeviceList()
+    elseif action == "Discover Local IPs" then
+      DiscoverLocalIps()
     end
   end
 end

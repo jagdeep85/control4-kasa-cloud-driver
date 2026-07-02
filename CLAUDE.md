@@ -39,7 +39,11 @@ For SMART devices with a **`Local IP (KLAP)`** property set, the light driver ta
 - **Request** — `seq++`; `iv_seq=iv..packBE32(seq)`; `ct=AES128CBC(key,iv_seq,pkcs7(json))`; body=`SHA256(sig..packBE32(seq)..ct)..ct`; `POST /app/request?seq=<seq>` with the session cookie. Response = `sig(32)..ct` → AES-decrypt → `{"error_code":0,"result":{device_on,brightness}}`. HTTP **403** ⇒ session expired: clear `g_klap`, re-handshake once, retry.
 - **Crypto** uses `C4:Hash`/`C4:Encrypt`/`C4:Decrypt` (all `*_encoding="NONE"` for raw bytes, `padding=false` — PKCS7 done in Lua). BE32 (un)packing is arithmetic (no `string.pack`) so it runs on Lua 5.1 and 5.3. `randBytes` derives the seed from hashed `os.time`/`os.clock`/`math.random`.
 - Only **KlapV2** is implemented (KS205/KS225). If `server_hash` never matches, the device may be KlapV1 (MD5-based) — not yet supported.
-- **Prereq:** the device needs a reserved LAN IP entered in `Local IP (KLAP)`. `getDeviceList` does not return the local IP, so it's manual (UDP-20002 discovery is a possible future add).
+- **Prereq:** the device needs a reserved LAN IP in `Local IP (KLAP)`. This is normally **auto-discovered** (below); it can also be entered manually.
+
+### UDP auto-discovery of KLAP IPs
+
+`getDeviceList` does not return local IPs, so the **account driver** finds them via UDP broadcast. It sends the fixed 16-byte query `020000010000000000000000463cb5d3` to `255.255.255.255:20002` (Kasa SMART discovery) using a runtime UDP connection — `C4:CreateNetworkConnection(6001,"255.255.255.255")` + `C4:NetConnect(6001,20002,"UDP")` + `C4:SendToNetwork`, the WoL-style pattern that needs **no** `<connections>` XML (so the combo self-proxy stays searchable). Replies arrive in `ReceivedFromNetwork(idBinding,nPort,strData)` as `16-byte header + plaintext JSON`; `result.device_id`/`result.ip` are parsed (device_id equals the cloud `deviceId`). After a ~2.5 s collection window it merges each IP into the shared list as field **`p`** and re-publishes var 3002. Runs after every `getDeviceList` and via the **Discover Local IPs** action. The light driver's `AutoFillLocalIp()` writes `p` into `Local IP (KLAP)` only when that property is **blank** (manual entry always wins). Broadcast only reaches the controller's own subnet — devices on another VLAN need a manual IP.
 
 ## C4 API notes
 

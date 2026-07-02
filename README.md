@@ -217,16 +217,19 @@ Enable **Debug = On** on either driver to trace logins, HTTP calls, and proxy co
 
 The driver definition XML **must be named `driver.xml` inside the `.c4z`** or Composer rejects it as "invalid file". The light driver's source is already `driver.xml`; the account driver's source is `account.xml` and must be copied to `driver.xml` when zipping.
 
-```powershell
-# Light driver
-Compress-Archive -Path driver.xml, driver.lua -DestinationPath tmp.zip -Force
-Rename-Item tmp.zip kasa_cloud_switch.c4z -Force
+```bash
+# Light driver (source XML already named driver.xml)
+rm -f kasa_cloud_switch.c4z
+zip kasa_cloud_switch.c4z driver.xml driver.lua
 
 # Account driver (account.xml → driver.xml inside the zip)
-$b = "build_account"; Remove-Item $b -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $b | Out-Null
-Copy-Item account.xml "$b\driver.xml" -Force; Copy-Item account.lua "$b\account.lua" -Force
-Compress-Archive -Path "$b\driver.xml", "$b\account.lua" -DestinationPath tmp.zip -Force
-Rename-Item tmp.zip kasa_account.c4z -Force; Remove-Item $b -Recurse -Force
+b=build_account
+rm -rf "$b"; mkdir "$b"
+cp account.xml "$b/driver.xml"
+cp account.lua "$b/account.lua"
+rm -f kasa_account.c4z
+( cd "$b" && zip ../kasa_account.c4z driver.xml account.lua )
+rm -rf "$b"
 ```
 
 See `CLAUDE.md` for deeper implementation notes (proxy protocol quirks, variable IDs, discovery internals).

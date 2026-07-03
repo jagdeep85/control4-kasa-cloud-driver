@@ -405,7 +405,8 @@ local function AutoFillLocalIp()
   if (Properties["Local IP (KLAP)"] or "") ~= "" then return end
   for _, d in ipairs(g_deviceList) do
     if tostring(d.i) == g_deviceId and type(d.p) == "string" and d.p ~= "" then
-      C4:UpdateProperty("Local IP (KLAP)", d.p)   -- fires OnPropertyChanged → LoadConfig → poll
+      g_localIp = d.p   -- set synchronously so the current poll routes to KLAP immediately
+      C4:UpdateProperty("Local IP (KLAP)", d.p)   -- persist; fires OnPropertyChanged → LoadConfig
       log("Auto-filled Local IP (KLAP) = " .. d.p .. " from discovery")
       return
     end

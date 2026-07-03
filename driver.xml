@@ -7,7 +7,7 @@
   <driver>DriverWorks</driver>
   <control>lua_gen</control>
   <controlmethod>ip</controlmethod>
-  <version>19</version>
+  <version>20</version>
   <created>2026-06-30</created>
   <modified>2026-07-01T12:00:00</modified>
   <minimum_os_version>3.3.0</minimum_os_version>

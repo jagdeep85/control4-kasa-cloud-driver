@@ -18,6 +18,7 @@ local API_URL   = "https://use1-wap.tplinkcloud.com"
 local PROXY_ID  = 5001
 local POLL_TIMER     = 1
 local DISCOVER_TIMER = 2
+local FILL_TIMER     = 3   -- short retry window to auto-fill Local IP after (re)config
 
 local ACCOUNT_FILE   = "kasa_account"  -- driver filename of the Kasa Account agent
 local ACCOUNT_NAME   = "TP-Link Kasa Account"
@@ -426,6 +427,23 @@ local function RefreshDiscoveredIp()
   end
 end
 
+-- After a SMART device is (re)configured with a blank IP, retry the discovery
+-- auto-fill on a short window so it lands promptly even when discovery completes
+-- just after this driver loaded — instead of waiting for the next 60s poll.
+local function StartFillRetry()
+  C4:KillTimer(FILL_TIMER)
+  if g_deviceType ~= "SMART" then return end
+  if (Properties["Local IP (KLAP)"] or "") ~= "" then return end
+  local tries = 0
+  C4:SetTimer(3000, function()
+    tries = tries + 1
+    RefreshDiscoveredIp()
+    if (Properties["Local IP (KLAP)"] or "") ~= "" or tries >= 10 then
+      C4:KillTimer(FILL_TIMER)
+    end
+  end, true, FILL_TIMER)   -- every 3s, up to ~30s, self-stops once filled
+end
+
 local function LoadConfig()
   g_deviceId     = Properties["Device ID"]         or ""
   g_deviceType   = Properties["Device Type"]       or "IOT"
@@ -819,6 +837,7 @@ local function Initialize()
   -- Establish proxy binding; real state comes from the first PollStatus()
   C4:SendToProxy(PROXY_ID, "LIGHT_BRIGHTNESS_CHANGED", { LIGHT_BRIGHTNESS_CURRENT = 0 }, "NOTIFY")
   StartDiscovery()
+  StartFillRetry()   -- pre-configured SMART device: fill its IP as soon as discovery lands
   -- Queues until the token arrives from the account agent, then flushes.
   PollStatus()
   StartPollTimer()
@@ -837,6 +856,7 @@ end
 function OnDriverDestroyed()
   C4:KillTimer(POLL_TIMER)
   C4:KillTimer(DISCOVER_TIMER)
+  C4:KillTimer(FILL_TIMER)
 end
 
 function OnPropertyChanged(strProperty)
@@ -844,6 +864,7 @@ function OnPropertyChanged(strProperty)
     local sel = Properties["Select Device From List"] or ""
     if sel ~= "" and ApplySelectedDevice(sel) then
       LoadConfig()   -- picks up the Device ID / Type / Is Dimmer we just set
+      StartFillRetry()  -- SMART: grab the discovered IP promptly (may not be published yet)
       PollStatus()
     end
     return
@@ -854,6 +875,7 @@ function OnPropertyChanged(strProperty)
     StartPollTimer()
   elseif strProperty == "Device ID" or strProperty == "Device Type"
       or strProperty == "Is Dimmer" or strProperty == "Local IP (KLAP)" then
+    StartFillRetry()
     PollStatus()
   end
 end

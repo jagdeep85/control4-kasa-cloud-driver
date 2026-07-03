@@ -211,7 +211,6 @@ local function fromJson(s) return json_decode(s)  end
 --   carries the same SMART {method,params} payloads the cloud path already builds.
 
 -- Raw-byte crypto wrappers over the C4 crypto API (all NONE = raw in/out).
-local function sha1(raw)   return C4:Hash("SHA1",   raw, { data_encoding = "NONE", return_encoding = "NONE" }) end
 local function sha256(raw) return C4:Hash("SHA256", raw, { data_encoding = "NONE", return_encoding = "NONE" }) end
 
 local function aesEnc(key, iv, data)
@@ -409,6 +408,21 @@ local function AutoFillLocalIp()
       log("Auto-filled Local IP (KLAP) = " .. d.p .. " from discovery")
       return
     end
+  end
+end
+
+-- Self-heal: re-read the shared list and retry the auto-fill. Called from the poll
+-- so a SMART device with a blank IP eventually picks up its discovered IP even if the
+-- variable-change notification was missed (e.g. discovery finished after this loaded).
+local function RefreshDiscoveredIp()
+  if g_deviceType ~= "SMART" or g_accountId == 0 then return end
+  if (Properties["Local IP (KLAP)"] or "") ~= "" then return end
+  local js = C4:GetDeviceVariable(g_accountId, DEVLIST_VAR_ID)
+  if type(js) ~= "string" or js == "" then return end
+  local parsed = fromJson(js)
+  if type(parsed) == "table" then
+    g_deviceList = parsed
+    AutoFillLocalIp()
   end
 end
 
@@ -714,6 +728,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local function PollStatus()
+  RefreshDiscoveredIp()   -- SMART + blank IP → try to pick up its discovered LAN IP
   dbg("Polling status")
   Send(BuildGetStatus(), function(inner)
     if not inner then return end

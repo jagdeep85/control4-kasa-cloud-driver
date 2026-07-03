@@ -39,6 +39,7 @@ local g_refreshHrs = 12
 local g_debug     = false
 
 local g_lastList   = nil    -- last device list built by FetchDeviceList (for IP merge)
+local g_idToMac    = {}      -- cloud deviceId -> normalized MAC (discovery join key)
 local g_discovered = {}      -- normalized device_id / mac -> LAN IP (from UDP discovery)
 local g_discNetUp  = false   -- UDP connection created?
 
@@ -241,17 +242,20 @@ local function EnsureDiscoveryNet()
 end
 
 -- Fold collected IPs into the cached list and re-publish var 3002.
+-- The discovery device_id is a DIFFERENT namespace from the cloud deviceId, so we
+-- join on MAC (both getDeviceList.deviceMac and the discovery reply carry it).
 local function MergeDiscovered()
   if type(g_lastList) ~= "table" then return end
   local n = 0
   for _, e in ipairs(g_lastList) do
-    local ip = g_discovered[normKey(e.i)]
+    local mac = g_idToMac[tostring(e.i)]
+    local ip  = mac and g_discovered[mac]
     if ip and ip ~= "" and e.p ~= ip then e.p = ip; n = n + 1 end
   end
   if n > 0 then
     C4:SetVariable(DEVLIST_VAR_ID, toJson(g_lastList))
   end
-  log("Discovery merge — " .. n .. " local IP(s) added to device list")
+  log("Discovery — " .. n .. " local IP(s) matched")
   C4:UpdateProperty("Status", "Discovered local IPs: " .. n)
 end
 
@@ -269,22 +273,18 @@ local function DiscoverLocalIps()
   C4:SetTimer(2500, function() MergeDiscovered() end, false, DISCOVER_TIMER)
 end
 
--- Director delivers UDP datagrams here. Parse device_id + ip from the reply.
+-- Director delivers UDP datagrams here. Parse device_id/mac + ip from the reply
+-- (16-byte header + plaintext JSON) and key the IP by MAC for the merge.
 function ReceivedFromNetwork(idBinding, nPort, strData)
   if idBinding ~= DISC_BINDING then return end
-  if type(strData) ~= "string" or #strData <= 16 then
-    dbg("Discovery RX ignored (len=" .. tostring(strData and #strData) .. ")")
-    return
-  end
+  if type(strData) ~= "string" or #strData <= 16 then return end
   local t = fromJson(strData:sub(17))         -- skip 16-byte header
   local r = t and t.result
-  if type(r) == "table" and r.device_id and r.ip then
-    g_discovered[normKey(r.device_id)] = r.ip
-    if r.mac then g_discovered[normKey(r.mac)] = r.ip end
-    dbg("Discovery RX: " .. tostring(r.device_model) .. " id=" .. tostring(r.device_id) ..
+  if type(r) == "table" and r.ip then
+    if r.device_id then g_discovered[normKey(r.device_id)] = r.ip end
+    if r.mac       then g_discovered[normKey(r.mac)]       = r.ip end
+    dbg("Discovery RX: " .. tostring(r.device_model) .. " mac=" .. tostring(r.mac) ..
         " ip=" .. tostring(r.ip))
-  else
-    dbg("Discovery RX unparsed (len=" .. #strData .. ")")
   end
 end
 
@@ -413,7 +413,9 @@ function FetchDeviceList()
     end
     local list = resp.result and resp.result.deviceList or {}
     local out = {}
+    g_idToMac = {}
     for _, d in ipairs(list) do
+      if d.deviceId and d.deviceMac then g_idToMac[tostring(d.deviceId)] = normKey(d.deviceMac) end
       local dtype = "IOT"
       local alias = d.alias or ""
       if type(d.deviceType) == "string" and d.deviceType:sub(1, 5) == "SMART" then
@@ -427,9 +429,8 @@ function FetchDeviceList()
       -- KS205/KS225 (KLAP firmware) drop off the legacy cloud and report status=0;
       -- the passthrough API cannot reach them. Flag it once so the installer knows.
       if dtype == "SMART" and tonumber(d.status) == 0 then
-        err("'" .. tostring(alias) .. "' (" .. tostring(d.deviceModel) ..
-            ") is offline in the legacy Kasa cloud (status=0) — likely KLAP firmware, " ..
-            "NOT controllable via cloud passthrough. Needs local (python-kasa) or Matter control.")
+        dbg("'" .. tostring(alias) .. "' (" .. tostring(d.deviceModel) ..
+            ") is cloud-offline (status=0) — controlled locally via KLAP.")
       end
       out[#out + 1] = {
         a = alias,
